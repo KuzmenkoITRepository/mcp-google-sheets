@@ -12,6 +12,9 @@ import json
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+import threading
 
 # MCP imports
 from mcp.server.fastmcp import FastMCP, Context
@@ -31,6 +34,131 @@ TOKEN_PATH = os.environ.get('TOKEN_PATH', 'token.json')
 CREDENTIALS_PATH = os.environ.get('CREDENTIALS_PATH', 'credentials.json')
 SERVICE_ACCOUNT_PATH = os.environ.get('SERVICE_ACCOUNT_PATH', 'service_account.json')
 DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID', '')  # Working directory in Google Drive
+
+# OAuth callback handler
+class OAuthCallbackHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        
+        if parsed.path == '/':
+            # Root route - show auth link (like google-calendar-mcp)
+            auth_url = getattr(self.server, 'auth_url', None)
+            if auth_url:
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                self.wfile.write(f'''
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>Google Sheets Authentication</title></head>
+                    <body>
+                        <h1>Google Sheets Authentication</h1>
+                        <p><a href="{auth_url}">Authenticate with Google</a></p>
+                    </body>
+                    </html>
+                '''.encode('utf-8'))
+            else:
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                self.wfile.write(b'<h1>OAuth server is running</h1>')
+        elif parsed.path == '/oauth2callback':
+            code = params.get('code', [None])[0]
+            if code:
+                self.server.auth_code = code
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                self.wfile.write(b'''
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>Authentication Successful</title></head>
+                    <body>
+                        <h1>Authentication Successful!</h1>
+                        <p>You can close this window.</p>
+                    </body>
+                    </html>
+                ''')
+            else:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'Authorization code missing')
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        pass  # Suppress default logging
+
+def run_oauth_flow(credentials_path: str, token_path: str, scopes: List[str]) -> Credentials:
+    """Run OAuth flow with custom HTTP server that listens on 0.0.0.0"""
+    flow = InstalledAppFlow.from_client_secrets_file(credentials_path, scopes)
+    
+    # Try ports 3600-3605 (same as google-calendar-mcp pattern)
+    port_range = range(3600, 3606)
+    server = None
+    port = None
+    
+    for test_port in port_range:
+        try:
+            server = HTTPServer(('0.0.0.0', test_port), OAuthCallbackHandler)
+            server.auth_code = None
+            port = test_port
+            break
+        except OSError:
+            continue
+    
+    if server is None:
+        raise Exception("Could not start OAuth server on any port in range 3600-3605")
+    
+    # Set redirect URI
+    redirect_uri = f'http://localhost:{port}/oauth2callback'
+    flow.redirect_uri = redirect_uri
+    
+    # Generate auth URL
+    auth_url, _ = flow.authorization_url(prompt='consent')
+    
+    # Store auth URL in server for root route
+    server.auth_url = auth_url
+    
+    print("Starting OAuth flow...")
+    print(f"Please visit this URL to authorize this application:")
+    print(auth_url)
+    print(f"\nOr visit: http://localhost:{port}")
+    print(f"\nWaiting for OAuth callback on port {port}...")
+    
+    # Start server in background thread
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+    
+    # Wait for callback
+    try:
+        while server.auth_code is None:
+            import time
+            time.sleep(0.5)
+        
+        # Exchange code for tokens
+        flow.fetch_token(code=server.auth_code)
+        creds = flow.credentials
+        
+        # Save tokens
+        os.makedirs(os.path.dirname(token_path) if os.path.dirname(token_path) else '.', exist_ok=True)
+        with open(token_path, 'w') as token:
+            token.write(creds.to_json())
+        
+        print("Successfully authenticated using OAuth flow")
+        
+        # Stop server
+        server.shutdown()
+        server.server_close()
+        
+        return creds
+    except KeyboardInterrupt:
+        server.shutdown()
+        server.server_close()
+        raise
 
 @dataclass
 class SpreadsheetContext:
@@ -66,9 +194,16 @@ async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetCont
     # Fall back to OAuth flow if service account auth failed or not configured
     if not creds:
         print("Trying OAuth authentication flow")
-        if os.path.exists(TOKEN_PATH):
-            with open(TOKEN_PATH, 'r') as token:
-                creds = Credentials.from_authorized_user_info(json.load(token), SCOPES)
+        if os.path.exists(TOKEN_PATH) and os.path.getsize(TOKEN_PATH) > 0:
+            try:
+                with open(TOKEN_PATH, 'r') as token:
+                    token_data = token.read().strip()
+                    if token_data:  # Check if file is not empty
+                        creds = Credentials.from_authorized_user_info(json.loads(token_data), SCOPES)
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"Error loading token file (may be empty or invalid): {e}")
+                print("Will trigger OAuth flow to get new tokens")
+                creds = None
                 
         # If credentials are not valid or don't exist, get new ones
         if not creds or not creds.valid:
@@ -88,15 +223,11 @@ async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetCont
             # If refresh failed or creds don't exist, run OAuth flow
             if not creds:
                 try:
-                    flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-                    creds = flow.run_local_server(port=0)
-
-                    # Save the credentials for the next run
-                    with open(TOKEN_PATH, 'w') as token:
-                        token.write(creds.to_json())
-                    print("Successfully authenticated using OAuth flow")
+                    creds = run_oauth_flow(CREDENTIALS_PATH, TOKEN_PATH, SCOPES)
                 except Exception as e:
                     print(f"Error with OAuth flow: {e}")
+                    import traceback
+                    traceback.print_exc()
                     creds = None
     
     # Try Application Default Credentials if no creds thus far
