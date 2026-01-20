@@ -1,4 +1,48 @@
+# Git
+.git
+.gitignore
+.github
+
+# Python
 .venv/
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+ENV/
+env/
+
+# Build artifacts
 dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+*.md
+!README.md
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Environment
 .env
+.env.local
+
+# Test files
+tests/
+test_*.py
+*_test.py

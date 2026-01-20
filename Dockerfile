@@ -31,12 +31,12 @@ COPY uv.lock* ./
 # Create venv and install dependencies (without installing the project package)
 RUN uv venv && uv sync --no-install-project
 
-# Remove installed package if exists to force using source code
-RUN rm -rf /app/.venv/lib/python*/site-packages/mcp_google_sheets* 2>/dev/null || true
-
 # Copy source code and README (after dependencies are installed for better caching)
 COPY src ./src
 COPY README.md ./
+
+# Remove installed package if exists to force using source code (do this after copying src for better caching)
+RUN rm -rf /app/.venv/lib/python*/site-packages/mcp_google_sheets* 2>/dev/null || true
 
 # Set PYTHONPATH to include src directory
 ENV PYTHONPATH=/app/src
