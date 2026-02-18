@@ -1,29 +1,20 @@
-FROM alpine:latest
+FROM python:3.11-slim
 
 WORKDIR /app
 
 ENV LANG=C.UTF-8 \
-    PATH="/root/.local/bin:${PATH}" \
     PYTHONPATH=/app/src
 
-# Install packages and uv in one layer, remove git after uv install (not needed at runtime)
-RUN apk add --no-cache bash curl tini coreutils && \
-    curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    rm -rf /var/cache/apk/*
-
-ENTRYPOINT ["/sbin/tini", "--"]
-
-# Copy dependency files first for better layer caching
-COPY .python-version pyproject.toml uv.lock* ./
-
-# Create venv and install dependencies (without installing the project package)
-RUN uv venv && uv sync --no-install-project
-
-# Copy source code (after dependencies for better caching)
+# Copy source first so module is available via PYTHONPATH in runtime.
 COPY src ./src
 
-# Remove installed package if exists to force using source code
-RUN rm -rf /app/.venv/lib/python*/site-packages/mcp_google_sheets* 2>/dev/null || true
+# Install runtime dependencies directly (without uv) to avoid flaky external installer.
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+        "mcp>=1.5.0" \
+        "google-auth>=2.28.1" \
+        "google-auth-oauthlib>=1.2.0" \
+        "google-api-python-client>=2.117.0"
 
-# CMD will be overridden in docker-compose.yml to use sleep infinity
-CMD ["uv", "run", "python", "-m", "mcp_google_sheets", "--transport", "stdio"]
+# CMD will be overridden in docker-compose.yml to use sleep infinity.
+CMD ["python3", "-m", "mcp_google_sheets.server", "--transport", "stdio"]
